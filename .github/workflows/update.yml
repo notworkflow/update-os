@@ -1,0 +1,92 @@
+name: Check Bazzite Latest and Trigger Pipeline
+
+on:
+  schedule:
+    - cron: '0/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-trigger:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch latest Bazzite digest
+        id: latest
+        run: |
+          DIGEST=$(docker manifest inspect ghcr.io/ublue-os/bazzite-dx-nvidia:latest | jq -r '.config.digest')
+          if [ "$DIGEST" = "null" ]; then
+            echo "No manifest found for 'latest'. Exiting."
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Fetch previous tracked digest
+        id: prev
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10")
+          PREV_DIGEST=$(echo "$RESPONSE" | jq -r '(map(select(.tag_name == "bazzite-tracker")) | first) as $tracker | if $tracker then $tracker.body | fromjson | .digest // empty else empty end')
+          echo "digest=$PREV_DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Check if new version
+        id: is-new
+        run: |
+          NEW_DIGEST="${{ steps.latest.outputs.digest }}"
+          PREV_DIGEST="${{ steps.prev.outputs.digest }}"
+          if [ "$PREV_DIGEST" = "" ] || [ "$NEW_DIGEST" != "$PREV_DIGEST" ]; then
+            echo "is_new=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_new=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update tracker release
+        if: steps.is-new.outputs.is_new == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INNER_JSON=$(jq -n \
+            --arg digest "${{ steps.latest.outputs.digest }}" \
+            '{digest: $digest} | tojson')
+          
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10")
+          TRACKER=$(echo "$RESPONSE" | jq -r 'map(select(.tag_name == "bazzite-tracker")) | first')
+          
+          if [ "$TRACKER" != "null" ] && echo "$TRACKER" | jq -e '.id' > /dev/null 2>&1; then
+            PATCH_BODY=$(jq -n \
+              --argjson body "$INNER_JSON" \
+              '{body: $body}')
+            RELEASE_ID=$(echo "$TRACKER" | jq -r '.id')
+            curl -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "$PATCH_BODY" \
+              https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID
+          else
+            CREATE_BODY=$(jq -n \
+              --arg tag_name "bazzite-tracker" \
+              --arg name "Bazzite Latest Tracker" \
+              --argjson body "$INNER_JSON" \
+              --argjson draft true \
+              '{tag_name: $tag_name, name: $name, body: $body, draft: $draft}')
+            curl -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "$CREATE_BODY" \
+              https://api.github.com/repos/${{ github.repository }}/releases
+          fi
+
+      - name: Trigger GitLab Pipeline
+        if: steps.is-new.outputs.is_new == 'true'
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
+        run: |
+          curl -X POST \
+            "https://gitlab.com/api/v4/projects/76001048/ref/main/trigger/pipeline?token=$GITLAB_TOKEN" \
+            -F "variables[BAZZITE_DIGEST]=${{ steps.latest.outputs.digest }}"
